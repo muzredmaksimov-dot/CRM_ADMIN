@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 import os
-import re
+import json
 import logging
 import threading
 from datetime import datetime, timedelta
@@ -14,7 +14,7 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from apscheduler.schedulers.background import BackgroundScheduler
 
-# ==================== ВЕБ-СЕРВЕР ДЛЯ RENDER ====================
+# ==================== ВЕБ-СЕРВЕР ====================
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -30,10 +30,10 @@ def run_web_server():
 
 # ==================== НАСТРОЙКИ ====================
 load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN")  # Токен АДМИН-БОТА
-SHEET_ID = os.getenv("SHEET_ID")    # ID вашей таблицы clients
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+SHEET_ID = os.getenv("SHEET_ID")
 GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDENTIALS")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # Ваш Telegram ID
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -48,66 +48,73 @@ sheet = client.open_by_key(SHEET_ID).sheet1
 bot = telebot.TeleBot(BOT_TOKEN)
 scheduler = BackgroundScheduler()
 
-# ==================== РАБОТА С ТАБЛИЦЕЙ КЛИЕНТОВ ====================
+user_state = {}
+user_data = {}
+
+# ==================== РАБОТА С ТАБЛИЦЕЙ ====================
 def get_clients():
-    """Возвращает список всех клиентов"""
     rows = sheet.get_all_values()
     if len(rows) <= 1:
         return []
     clients = []
     for r in rows[1:]:
-        if len(r) >= 7:
+        if len(r) >= 6:
             clients.append({
                 "id": r[0],
                 "name": r[1],
-                "telegram": r[2],
-                "bot_token": r[3],
-                "sheet_id": r[4],
-                "paid_until": r[5],
-                "status": r[6]
+                "activity": r[2],
+                "phone": r[3],
+                "status": r[4],
+                "paid_until": r[5] if len(r) > 5 else ""
             })
     return clients
 
-def update_client_status(name, status):
-    """Обновляет статус клиента"""
+def get_client_by_id(client_id):
+    clients = get_clients()
+    for c in clients:
+        if c["id"] == str(client_id):
+            return c
+    return None
+
+def get_client_by_name(name):
+    clients = get_clients()
+    for c in clients:
+        if c["name"].lower() == name.lower():
+            return c
+    return None
+
+def update_client_field(client_id, field_col, value):
     try:
-        cell = sheet.find(name, in_column=2)
+        cell = sheet.find(str(client_id), in_column=1)
         if cell:
-            sheet.update_cell(cell.row, 7, status)
+            sheet.update_cell(cell.row, field_col, value)
             return True
     except:
         pass
     return False
 
-def extend_subscription(name, days):
-    """Продлевает подписку на указанное количество дней"""
+def update_client_status(client_id, status, paid_until=None):
     try:
-        cell = sheet.find(name, in_column=2)
+        cell = sheet.find(str(client_id), in_column=1)
         if cell:
-            current = sheet.cell(cell.row, 6).value
-            if current:
-                dt = datetime.strptime(current, "%d.%m.%Y")
-            else:
-                dt = datetime.now()
-            new_dt = dt + timedelta(days=days)
-            new_date = new_dt.strftime("%d.%m.%Y")
-            sheet.update_cell(cell.row, 6, new_date)
-            sheet.update_cell(cell.row, 7, "Активен")
-            return new_date
+            sheet.update_cell(cell.row, 5, status)
+            if paid_until:
+                sheet.update_cell(cell.row, 6, paid_until)
+            return True
     except:
         pass
-    return None
+    return False
 
-def add_client(name, telegram, bot_token, sheet_id, paid_until):
-    """Добавляет нового клиента"""
+def add_client(name, activity, phone):
     rows = sheet.get_all_values()
-    new_id = len(rows)
-    sheet.append_row([str(new_id), name, telegram, bot_token, sheet_id, paid_until, "Активен"])
+    new_id = str(len(rows))
+    today = datetime.now()
+    test_until = (today + timedelta(days=30)).strftime("%d.%m.%Y")
+    sheet.append_row([new_id, name, activity, phone, "Тест", test_until])
     return new_id
 
-# ==================== ПРОВЕРКА ОПЛАТ ====================
+# ==================== ПРОВЕРКА И УВЕДОМЛЕНИЯ ====================
 def check_payments():
-    """Проверяет сроки оплаты и отправляет уведомления админу"""
     clients = get_clients()
     today = datetime.now().date()
     
@@ -116,7 +123,7 @@ def check_payments():
     soon_7 = []
     
     for c in clients:
-        if c["status"] != "Активен":
+        if c["status"] not in ["Активен", "Тест"]:
             continue
         try:
             paid_date = datetime.strptime(c["paid_until"], "%d.%m.%Y").date()
@@ -124,8 +131,7 @@ def check_payments():
             
             if days_left < 0:
                 expired.append(c)
-                # Автоматически меняем статус на Просрочен
-                update_client_status(c["name"], "Просрочен")
+                update_client_status(c["id"], "Просрочен", c["paid_until"])
             elif days_left <= 3:
                 soon_3.append(c)
             elif days_left <= 7:
@@ -133,203 +139,319 @@ def check_payments():
         except:
             pass
     
-    if expired or soon_3 or soon_7:
-        msg = "📅 **Напоминания по оплате:**\n\n"
-        
-        if expired:
-            msg += "🔴 **ПРОСРОЧЕНЫ:**\n"
-            for c in expired:
-                msg += f"• {c['name']} ({c['telegram']}) — просрочено\n"
-            msg += "\n"
-        
-        if soon_3:
-            msg += "🟡 **Заканчивается через 1-3 дня:**\n"
-            for c in soon_3:
-                msg += f"• {c['name']} ({c['telegram']}) — до {c['paid_until']}\n"
-            msg += "\n"
-        
-        if soon_7:
-            msg += "🟢 **Заканчивается через 4-7 дней:**\n"
-            for c in soon_7:
-                msg += f"• {c['name']} ({c['telegram']}) — до {c['paid_until']}\n"
-        
-        msg += "\n---\n"
-        msg += "💳 **Реквизиты для оплаты:**\n"
-        msg += "Сбер: 2202 20XX XXXX 1234\n"
-        msg += "Тинькофф: 5536 91XX XXXX 5678\n"
-        msg += "ЮMoney: 4100 11XX XXXX 9012"
-        
-        bot.send_message(ADMIN_ID, msg, parse_mode='Markdown')
+    if not expired and not soon_3 and not soon_7:
+        return
+    
+    msg = "📅 **Напоминания по оплате:**\n\n"
+    
+    if expired:
+        msg += "🔴 **ПРОСРОЧЕНЫ:**\n"
+        for c in expired:
+            msg += f"• {c['name']} ({c['activity']}) — {c['phone']}\n"
+        msg += "\n"
+    
+    if soon_3:
+        msg += "🟡 **Заканчивается через 1-3 дня:**\n"
+        for c in soon_3:
+            msg += f"• {c['name']} ({c['activity']}) — до {c['paid_until']}\n"
+        msg += "\n"
+    
+    if soon_7:
+        msg += "🟢 **Заканчивается через 4-7 дней:**\n"
+        for c in soon_7:
+            msg += f"• {c['name']} ({c['activity']}) — до {c['paid_until']}\n"
+        msg += "\n"
+    
+    bot.send_message(ADMIN_ID, msg, parse_mode='Markdown')
 
-# ==================== КОМАНДЫ АДМИН-БОТА ====================
-@bot.message_handler(commands=['start', 'help'])
+# ==================== КНОПКИ ====================
+def main_menu_keyboard():
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row("➕ Добавить клиента", "📋 Все клиенты")
+    kb.row("🔍 Поиск")
+    return kb
+
+def client_card_keyboard(client_id):
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        types.InlineKeyboardButton("🔄 Тестовый период 30 дней", callback_data=f"status_test_{client_id}"),
+        types.InlineKeyboardButton("✅ Оплачен на 30 дней", callback_data=f"status_paid_{client_id}"),
+        types.InlineKeyboardButton("❌ Просрочен / не активен", callback_data=f"status_expired_{client_id}"),
+        types.InlineKeyboardButton("💳 Отправить реквизиты ЕРИП", callback_data=f"erip_{client_id}"),
+        types.InlineKeyboardButton("✏️ Редактировать", callback_data=f"edit_client_{client_id}")
+    )
+    return kb
+
+def erip_keyboard():
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("🔙 Назад", callback_data="back_to_clients"))
+    return kb
+
+# ==================== КОМАНДЫ ====================
+@bot.message_handler(commands=['start'])
 def cmd_start(message):
     if message.chat.id != ADMIN_ID:
         bot.reply_to(message, "⛔ Доступ запрещён.")
         return
     
-    msg = "🤖 **Админ-бот CRM Larich Food**\n\n"
-    msg += "**Команды:**\n"
-    msg += "/clients — список всех клиентов\n"
-    msg += "/expired — просроченные клиенты\n"
-    msg += "/add Имя @user токен sheet_id ДД.ММ.ГГГГ — добавить клиента\n"
-    msg += "/extend Имя 30 — продлить на N дней\n"
-    msg += "/block Имя — заблокировать\n"
-    msg += "/unblock Имя — разблокировать\n"
-    msg += "/remind Имя — напомнить о платеже\n"
-    msg += "/check — проверить оплаты сейчас"
-    
-    bot.send_message(message.chat.id, msg, parse_mode='Markdown')
+    bot.send_message(
+        message.chat.id,
+        "🏠 **Админ-панель CRM**\n\nВыберите действие:",
+        reply_markup=main_menu_keyboard(),
+        parse_mode='Markdown'
+    )
 
-@bot.message_handler(commands=['clients'])
-def cmd_clients(message):
+# ==================== ОБРАБОТКА СООБЩЕНИЙ ====================
+@bot.message_handler(func=lambda m: True)
+def handle_message(message):
     if message.chat.id != ADMIN_ID:
+        bot.reply_to(message, "⛔ Доступ запрещён.")
         return
     
+    chat_id = message.chat.id
+    text = message.text
+    
+    if chat_id not in user_state:
+        user_state[chat_id] = None
+        user_data[chat_id] = {}
+    
+    state = user_state.get(chat_id)
+    
+    if text == "➕ Добавить клиента":
+        user_state[chat_id] = "WAIT_NAME"
+        bot.send_message(chat_id, "👤 Введите имя клиента:")
+        return
+    
+    elif text == "📋 Все клиенты":
+        show_all_clients(chat_id)
+        return
+    
+    elif text == "🔍 Поиск":
+        user_state[chat_id] = "WAIT_SEARCH"
+        bot.send_message(chat_id, "🔍 Введите имя клиента:")
+        return
+    
+    elif text == "🏠 Главное меню":
+        user_state[chat_id] = None
+        bot.send_message(chat_id, "Главное меню:", reply_markup=main_menu_keyboard())
+        return
+    
+    # Обработка состояний
+    if state == "WAIT_NAME":
+        user_data[chat_id]["new_name"] = text
+        user_state[chat_id] = "WAIT_ACTIVITY"
+        bot.send_message(chat_id, "📋 Введите вид деятельности (например: Копчение мяса):")
+    
+    elif state == "WAIT_ACTIVITY":
+        user_data[chat_id]["new_activity"] = text
+        user_state[chat_id] = "WAIT_PHONE"
+        bot.send_message(chat_id, "📞 Введите телефон клиента:")
+    
+    elif state == "WAIT_PHONE":
+        name = user_data[chat_id].get("new_name", "")
+        activity = user_data[chat_id].get("new_activity", "")
+        phone = text
+        
+        client_id = add_client(name, activity, phone)
+        
+        bot.send_message(
+            chat_id,
+            f"✅ Клиент **{name}** добавлен!\nID: {client_id}\nТестовый период: 30 дней",
+            reply_markup=main_menu_keyboard(),
+            parse_mode='Markdown'
+        )
+        user_state[chat_id] = None
+        user_data[chat_id] = {}
+    
+    elif state == "WAIT_SEARCH":
+        client = get_client_by_name(text)
+        if client:
+            show_client_card(chat_id, client, new_message=True)
+        else:
+            bot.send_message(chat_id, f"❌ Клиент **{text}** не найден.", parse_mode='Markdown')
+        user_state[chat_id] = None
+    
+    elif state == "EDIT_NAME":
+        client_id = user_data[chat_id].get("edit_client_id")
+        if update_client_field(client_id, 2, text):
+            bot.send_message(chat_id, f"✅ Имя изменено на {text}")
+        user_state[chat_id] = None
+        show_client_by_id(chat_id, client_id)
+    
+    elif state == "EDIT_ACTIVITY":
+        client_id = user_data[chat_id].get("edit_client_id")
+        if update_client_field(client_id, 3, text):
+            bot.send_message(chat_id, f"✅ Деятельность изменена")
+        user_state[chat_id] = None
+        show_client_by_id(chat_id, client_id)
+    
+    elif state == "EDIT_PHONE":
+        client_id = user_data[chat_id].get("edit_client_id")
+        if update_client_field(client_id, 4, text):
+            bot.send_message(chat_id, f"✅ Телефон изменён на {text}")
+        user_state[chat_id] = None
+        show_client_by_id(chat_id, client_id)
+
+def show_all_clients(chat_id):
     clients = get_clients()
     if not clients:
-        bot.reply_to(message, "📭 Нет клиентов.")
+        bot.send_message(chat_id, "📭 Нет клиентов.", reply_markup=main_menu_keyboard())
         return
     
-    msg = "📋 **Список клиентов:**\n\n"
+    kb = types.InlineKeyboardMarkup(row_width=1)
     for c in clients:
-        emoji = "✅" if c["status"] == "Активен" else "❌"
-        msg += f"{emoji} {c['name']} ({c['telegram']}) — до {c['paid_until']}\n"
+        status_emoji = "🟢" if c["status"] == "Активен" else "🟡" if c["status"] == "Тест" else "🔴"
+        btn_text = f"{status_emoji} {c['name']} ({c['activity']})"
+        kb.add(types.InlineKeyboardButton(btn_text, callback_data=f"view_{c['id']}"))
     
-    bot.send_message(message.chat.id, msg, parse_mode='Markdown')
+    bot.send_message(chat_id, "📋 **Все клиенты:**", reply_markup=kb, parse_mode='Markdown')
 
-@bot.message_handler(commands=['expired'])
-def cmd_expired(message):
-    if message.chat.id != ADMIN_ID:
-        return
+def show_client_card(chat_id, client, new_message=False):
+    status_emoji = "🟢" if client["status"] == "Активен" else "🟡" if client["status"] == "Тест" else "🔴"
     
-    clients = get_clients()
-    expired = [c for c in clients if c["status"] == "Просрочен"]
+    msg = f"👤 **{client['name']}**\n"
+    msg += f"📋 {client['activity']}\n"
+    msg += f"📞 {client['phone']}\n"
+    msg += f"📅 Статус: {status_emoji} {client['status']}"
+    if client["paid_until"]:
+        msg += f" (до {client['paid_until']})"
     
-    if not expired:
-        bot.reply_to(message, "✅ Нет просроченных клиентов.")
-        return
-    
-    msg = "🔴 **Просроченные клиенты:**\n\n"
-    for c in expired:
-        msg += f"• {c['name']} ({c['telegram']}) — {c['paid_until']}\n"
-    
-    msg += "\n---\n"
-    msg += "💳 **Реквизиты для отправки клиенту:**\n"
-    msg += "Сбер: 2202 20XX XXXX 1234 (Иван И.)\n"
-    msg += "Тинькофф: 5536 91XX XXXX 5678\n"
-    msg += "ЮMoney: 4100 11XX XXXX 9012"
-    
-    bot.send_message(message.chat.id, msg, parse_mode='Markdown')
-
-@bot.message_handler(commands=['add'])
-def cmd_add(message):
-    if message.chat.id != ADMIN_ID:
-        return
-    
-    parts = message.text.split(maxsplit=5)
-    if len(parts) < 6:
-        bot.reply_to(message, "❌ Формат: /add Имя @telegram bot_token sheet_id ДД.ММ.ГГГГ")
-        return
-    
-    name = parts[1]
-    telegram = parts[2]
-    bot_token = parts[3]
-    sheet_id = parts[4]
-    paid_until = parts[5]
-    
-    new_id = add_client(name, telegram, bot_token, sheet_id, paid_until)
-    bot.reply_to(message, f"✅ Клиент {name} добавлен! ID: {new_id}")
-
-@bot.message_handler(commands=['extend'])
-def cmd_extend(message):
-    if message.chat.id != ADMIN_ID:
-        return
-    
-    parts = message.text.split()
-    if len(parts) < 3:
-        bot.reply_to(message, "❌ Формат: /extend Имя 30")
-        return
-    
-    name = parts[1]
-    days = int(parts[2])
-    
-    new_date = extend_subscription(name, days)
-    if new_date:
-        bot.reply_to(message, f"✅ Подписка {name} продлена до {new_date}")
+    if new_message:
+        bot.send_message(chat_id, msg, reply_markup=client_card_keyboard(client['id']), parse_mode='Markdown')
     else:
-        bot.reply_to(message, f"❌ Клиент {name} не найден")
+        bot.edit_message_text(msg, chat_id, message_id=user_data[chat_id].get("last_msg_id"), 
+                              reply_markup=client_card_keyboard(client['id']), parse_mode='Markdown')
 
-@bot.message_handler(commands=['block'])
-def cmd_block(message):
-    if message.chat.id != ADMIN_ID:
-        return
-    
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2:
-        bot.reply_to(message, "❌ Формат: /block Имя")
-        return
-    
-    name = parts[1]
-    if update_client_status(name, "Заблокирован"):
-        bot.reply_to(message, f"✅ Клиент {name} заблокирован")
-    else:
-        bot.reply_to(message, f"❌ Клиент {name} не найден")
+def show_client_by_id(chat_id, client_id):
+    client = get_client_by_id(client_id)
+    if client:
+        show_client_card(chat_id, client, new_message=True)
 
-@bot.message_handler(commands=['unblock'])
-def cmd_unblock(message):
-    if message.chat.id != ADMIN_ID:
+# ==================== INLINE-КНОПКИ ====================
+@bot.callback_query_handler(func=lambda call: True)
+def handle_callback(call):
+    if call.message.chat.id != ADMIN_ID:
+        bot.answer_callback_query(call.id, "⛔ Доступ запрещён.", show_alert=True)
         return
     
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2:
-        bot.reply_to(message, "❌ Формат: /unblock Имя")
-        return
+    chat_id = call.message.chat.id
+    data = call.data
     
-    name = parts[1]
-    if update_client_status(name, "Активен"):
-        bot.reply_to(message, f"✅ Клиент {name} разблокирован")
-    else:
-        bot.reply_to(message, f"❌ Клиент {name} не найден")
-
-@bot.message_handler(commands=['remind'])
-def cmd_remind(message):
-    if message.chat.id != ADMIN_ID:
-        return
+    # Сохраняем message_id для редактирования
+    user_data[chat_id]["last_msg_id"] = call.message.message_id
     
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2:
-        bot.reply_to(message, "❌ Формат: /remind Имя")
-        return
+    # Просмотр клиента
+    if data.startswith("view_"):
+        client_id = data.split("_")[1]
+        client = get_client_by_id(client_id)
+        if client:
+            show_client_card(chat_id, client)
+        else:
+            bot.answer_callback_query(call.id, "Клиент не найден")
     
-    name = parts[1]
-    clients = get_clients()
-    client = next((c for c in clients if c["name"].lower() == name.lower()), None)
+    # Тестовый период 30 дней
+    elif data.startswith("status_test_"):
+        client_id = data.split("_")[2]
+        today = datetime.now()
+        test_until = (today + timedelta(days=30)).strftime("%d.%m.%Y")
+        if update_client_status(client_id, "Тест", test_until):
+            bot.answer_callback_query(call.id, "✅ Тестовый период активирован на 30 дней")
+            client = get_client_by_id(client_id)
+            if client:
+                show_client_card(chat_id, client)
+        else:
+            bot.answer_callback_query(call.id, "❌ Ошибка")
     
-    if not client:
-        bot.reply_to(message, f"❌ Клиент {name} не найден")
-        return
+    # Оплачен на 30 дней
+    elif data.startswith("status_paid_"):
+        client_id = data.split("_")[2]
+        today = datetime.now()
+        paid_until = (today + timedelta(days=30)).strftime("%d.%m.%Y")
+        if update_client_status(client_id, "Активен", paid_until):
+            bot.answer_callback_query(call.id, "✅ Статус изменён на «Активен» (30 дней)")
+            client = get_client_by_id(client_id)
+            if client:
+                show_client_card(chat_id, client)
+        else:
+            bot.answer_callback_query(call.id, "❌ Ошибка")
     
-    msg = f"📅 Напоминание для {client['name']}:\n\n"
-    msg += f"Подписка до: {client['paid_until']}\n"
-    msg += f"Статус: {client['status']}\n\n"
-    msg += "💳 Реквизиты для оплаты:\n"
-    msg += "Сбер: 2202 20XX XXXX 1234\n"
-    msg += "Тинькофф: 5536 91XX XXXX 5678"
+    # Просрочен / не активен
+    elif data.startswith("status_expired_"):
+        client_id = data.split("_")[2]
+        if update_client_status(client_id, "Просрочен"):
+            bot.answer_callback_query(call.id, "✅ Статус изменён на «Просрочен»")
+            client = get_client_by_id(client_id)
+            if client:
+                show_client_card(chat_id, client)
+        else:
+            bot.answer_callback_query(call.id, "❌ Ошибка")
     
-    bot.send_message(message.chat.id, msg)
-
-@bot.message_handler(commands=['check'])
-def cmd_check(message):
-    if message.chat.id != ADMIN_ID:
-        return
+    # Реквизиты ЕРИП
+    elif data.startswith("erip_"):
+        client_id = data.split("_")[1]
+        client = get_client_by_id(client_id)
+        if client:
+            msg = f"💳 **Реквизиты для оплаты через ЕРИП**\n\n"
+            msg += f"👤 Клиент: {client['name']}\n\n"
+            msg += "🏦 **Банк:** Беларусбанк / ЕРИП\n"
+            msg += "📌 **Код услуги:** 1234567\n"
+            msg += "👤 **Получатель:** ИП Иванов И.И.\n"
+            msg += "💵 **Сумма:** 50 BYN (30 дней)\n\n"
+            msg += "**Инструкция:**\n"
+            msg += "1. ЕРИП → Интернет-магазины/сервисы\n"
+            msg += "2. Введите код услуги: 1234567\n"
+            msg += "3. Введите сумму: 50.00\n"
+            msg += "4. Оплатите\n\n"
+            msg += "✅ После оплаты нажмите «Оплачен на 30 дней»"
+            
+            bot.send_message(chat_id, msg, reply_markup=erip_keyboard(), parse_mode='Markdown')
+            bot.answer_callback_query(call.id)
     
-    check_payments()
-    bot.reply_to(message, "✅ Проверка оплат выполнена")
+    # Редактирование клиента
+    elif data.startswith("edit_client_"):
+        client_id = data.split("_")[2]
+        client = get_client_by_id(client_id)
+        if client:
+            kb = types.InlineKeyboardMarkup(row_width=1)
+            kb.add(
+                types.InlineKeyboardButton("👤 Изменить имя", callback_data=f"edit_name_{client_id}"),
+                types.InlineKeyboardButton("📋 Изменить деятельность", callback_data=f"edit_activity_{client_id}"),
+                types.InlineKeyboardButton("📞 Изменить телефон", callback_data=f"edit_phone_{client_id}"),
+                types.InlineKeyboardButton("🔙 Назад", callback_data=f"view_{client_id}")
+            )
+            bot.edit_message_text(
+                f"✏️ Редактирование: {client['name']}",
+                chat_id, call.message.message_id, reply_markup=kb
+            )
+        bot.answer_callback_query(call.id)
+    
+    elif data.startswith("edit_name_"):
+        client_id = data.split("_")[2]
+        user_state[chat_id] = "EDIT_NAME"
+        user_data[chat_id]["edit_client_id"] = client_id
+        bot.edit_message_text("👤 Введите новое имя:", chat_id, call.message.message_id)
+        bot.answer_callback_query(call.id)
+    
+    elif data.startswith("edit_activity_"):
+        client_id = data.split("_")[2]
+        user_state[chat_id] = "EDIT_ACTIVITY"
+        user_data[chat_id]["edit_client_id"] = client_id
+        bot.edit_message_text("📋 Введите новую деятельность:", chat_id, call.message.message_id)
+        bot.answer_callback_query(call.id)
+    
+    elif data.startswith("edit_phone_"):
+        client_id = data.split("_")[2]
+        user_state[chat_id] = "EDIT_PHONE"
+        user_data[chat_id]["edit_client_id"] = client_id
+        bot.edit_message_text("📞 Введите новый телефон:", chat_id, call.message.message_id)
+        bot.answer_callback_query(call.id)
+    
+    elif data == "back_to_clients":
+        show_all_clients(chat_id)
+        bot.answer_callback_query(call.id)
 
 # ==================== ЗАПУСК ====================
 def main():
-    # Планировщик: проверка каждый день в 10:00
     scheduler.add_job(check_payments, 'cron', hour=10, minute=0)
     scheduler.start()
     
@@ -339,5 +461,4 @@ def main():
     bot.polling(none_stop=True)
 
 if __name__ == "__main__":
-    import json
     main()
