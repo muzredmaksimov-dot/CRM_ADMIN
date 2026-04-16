@@ -43,7 +43,12 @@ scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/au
 creds_dict = json.loads(GOOGLE_CREDS_JSON)
 creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
 client = gspread.authorize(creds)
-sheet = client.open_by_key(SHEET_ID).sheet1
+
+# Пробуем открыть лист
+try:
+    sheet = client.open_by_key(SHEET_ID).worksheet("Лист1")
+except:
+    sheet = client.open_by_key(SHEET_ID).sheet1
 
 bot = telebot.TeleBot(BOT_TOKEN)
 scheduler = BackgroundScheduler()
@@ -58,14 +63,15 @@ def get_clients():
         return []
     clients = []
     for r in rows[1:]:
-        if len(r) >= 6:
+        if len(r) >= 1 and r[0]:
             clients.append({
                 "id": r[0],
-                "name": r[1],
-                "activity": r[2],
-                "phone": r[3],
-                "status": r[4],
-                "paid_until": r[5] if len(r) > 5 else ""
+                "name": r[1] if len(r) > 1 else "",
+                "activity": r[2] if len(r) > 2 else "",
+                "phone": r[3] if len(r) > 3 else "",
+                "status": r[4] if len(r) > 4 else "",
+                "paid_until": r[5] if len(r) > 5 else "",
+                "notes": r[6] if len(r) > 6 else ""
             })
     return clients
 
@@ -110,8 +116,18 @@ def add_client(name, activity, phone):
     new_id = str(len(rows))
     today = datetime.now()
     test_until = (today + timedelta(days=30)).strftime("%d.%m.%Y")
-    sheet.append_row([new_id, name, activity, phone, "Тест", test_until])
+    sheet.append_row([new_id, name, activity, phone, "Тест", test_until, ""])
     return new_id
+
+def calculate_days_left(paid_until):
+    if not paid_until:
+        return None
+    try:
+        dt = datetime.strptime(paid_until, "%d.%m.%Y").date()
+        today = datetime.now().date()
+        return (dt - today).days
+    except:
+        return None
 
 # ==================== ПРОВЕРКА И УВЕДОМЛЕНИЯ ====================
 def check_payments():
@@ -178,13 +194,15 @@ def client_card_keyboard(client_id):
         types.InlineKeyboardButton("✅ Оплачен на 30 дней", callback_data=f"status_paid_{client_id}"),
         types.InlineKeyboardButton("❌ Просрочен / не активен", callback_data=f"status_expired_{client_id}"),
         types.InlineKeyboardButton("💳 Отправить реквизиты ЕРИП", callback_data=f"erip_{client_id}"),
+        types.InlineKeyboardButton("📝 Добавить / изменить заметку", callback_data=f"note_{client_id}"),
         types.InlineKeyboardButton("✏️ Редактировать", callback_data=f"edit_client_{client_id}")
     )
     return kb
 
-def erip_keyboard():
+def back_to_client_keyboard(client_id):
     kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton("🔙 Назад", callback_data="back_to_clients"))
+    kb.add(types.InlineKeyboardButton("🔙 Назад к клиенту", callback_data=f"view_{client_id}"))
+    kb.add(types.InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu"))
     return kb
 
 # ==================== КОМАНДЫ ====================
@@ -291,6 +309,13 @@ def handle_message(message):
             bot.send_message(chat_id, f"✅ Телефон изменён на {text}")
         user_state[chat_id] = None
         show_client_by_id(chat_id, client_id)
+    
+    elif state == "EDIT_NOTE":
+        client_id = user_data[chat_id].get("edit_client_id")
+        if update_client_field(client_id, 7, text):
+            bot.send_message(chat_id, f"✅ Заметка сохранена")
+        user_state[chat_id] = None
+        show_client_by_id(chat_id, client_id)
 
 def show_all_clients(chat_id):
     clients = get_clients()
@@ -301,13 +326,17 @@ def show_all_clients(chat_id):
     kb = types.InlineKeyboardMarkup(row_width=1)
     for c in clients:
         status_emoji = "🟢" if c["status"] == "Активен" else "🟡" if c["status"] == "Тест" else "🔴"
-        btn_text = f"{status_emoji} {c['name']} ({c['activity']})"
+        days_left = calculate_days_left(c["paid_until"])
+        days_text = f" ({days_left} дн)" if days_left is not None else ""
+        btn_text = f"{status_emoji} {c['name']} ({c['activity']}){days_text}"
         kb.add(types.InlineKeyboardButton(btn_text, callback_data=f"view_{c['id']}"))
     
+    kb.add(types.InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu"))
     bot.send_message(chat_id, "📋 **Все клиенты:**", reply_markup=kb, parse_mode='Markdown')
 
 def show_client_card(chat_id, client, new_message=False):
     status_emoji = "🟢" if client["status"] == "Активен" else "🟡" if client["status"] == "Тест" else "🔴"
+    days_left = calculate_days_left(client["paid_until"])
     
     msg = f"👤 **{client['name']}**\n"
     msg += f"📋 {client['activity']}\n"
@@ -315,9 +344,17 @@ def show_client_card(chat_id, client, new_message=False):
     msg += f"📅 Статус: {status_emoji} {client['status']}"
     if client["paid_until"]:
         msg += f" (до {client['paid_until']})"
+        if days_left is not None:
+            if days_left < 0:
+                msg += f" — просрочено на {abs(days_left)} дн."
+            else:
+                msg += f" — осталось {days_left} дн."
+    if client["notes"]:
+        msg += f"\n\n📝 **Заметки:**\n{client['notes']}"
     
     if new_message:
-        bot.send_message(chat_id, msg, reply_markup=client_card_keyboard(client['id']), parse_mode='Markdown')
+        msg_sent = bot.send_message(chat_id, msg, reply_markup=client_card_keyboard(client['id']), parse_mode='Markdown')
+        user_data[chat_id]["last_msg_id"] = msg_sent.message_id
     else:
         bot.edit_message_text(msg, chat_id, message_id=user_data[chat_id].get("last_msg_id"), 
                               reply_markup=client_card_keyboard(client['id']), parse_mode='Markdown')
@@ -337,8 +374,14 @@ def handle_callback(call):
     chat_id = call.message.chat.id
     data = call.data
     
-    # Сохраняем message_id для редактирования
     user_data[chat_id]["last_msg_id"] = call.message.message_id
+    
+    # Главное меню
+    if data == "main_menu":
+        bot.edit_message_text("🏠 Главное меню:", chat_id, call.message.message_id)
+        bot.send_message(chat_id, "Выберите действие:", reply_markup=main_menu_keyboard())
+        bot.answer_callback_query(call.id)
+        return
     
     # Просмотр клиента
     if data.startswith("view_"):
@@ -404,8 +447,23 @@ def handle_callback(call):
             msg += "4. Оплатите\n\n"
             msg += "✅ После оплаты нажмите «Оплачен на 30 дней»"
             
-            bot.send_message(chat_id, msg, reply_markup=erip_keyboard(), parse_mode='Markdown')
-            bot.answer_callback_query(call.id)
+            kb = types.InlineKeyboardMarkup()
+            kb.add(types.InlineKeyboardButton("🔙 Назад к клиенту", callback_data=f"view_{client_id}"))
+            
+            bot.edit_message_text(msg, chat_id, call.message.message_id, reply_markup=kb, parse_mode='Markdown')
+        bot.answer_callback_query(call.id)
+    
+    # Добавить заметку
+    elif data.startswith("note_"):
+        client_id = data.split("_")[1]
+        user_state[chat_id] = "EDIT_NOTE"
+        user_data[chat_id]["edit_client_id"] = client_id
+        bot.edit_message_text(
+            "📝 Введите заметку (или '-' чтобы очистить):",
+            chat_id, call.message.message_id,
+            reply_markup=back_to_client_keyboard(client_id)
+        )
+        bot.answer_callback_query(call.id)
     
     # Редактирование клиента
     elif data.startswith("edit_client_"):
@@ -429,25 +487,30 @@ def handle_callback(call):
         client_id = data.split("_")[2]
         user_state[chat_id] = "EDIT_NAME"
         user_data[chat_id]["edit_client_id"] = client_id
-        bot.edit_message_text("👤 Введите новое имя:", chat_id, call.message.message_id)
+        bot.edit_message_text(
+            "👤 Введите новое имя:", chat_id, call.message.message_id,
+            reply_markup=back_to_client_keyboard(client_id)
+        )
         bot.answer_callback_query(call.id)
     
     elif data.startswith("edit_activity_"):
         client_id = data.split("_")[2]
         user_state[chat_id] = "EDIT_ACTIVITY"
         user_data[chat_id]["edit_client_id"] = client_id
-        bot.edit_message_text("📋 Введите новую деятельность:", chat_id, call.message.message_id)
+        bot.edit_message_text(
+            "📋 Введите новую деятельность:", chat_id, call.message.message_id,
+            reply_markup=back_to_client_keyboard(client_id)
+        )
         bot.answer_callback_query(call.id)
     
     elif data.startswith("edit_phone_"):
         client_id = data.split("_")[2]
         user_state[chat_id] = "EDIT_PHONE"
         user_data[chat_id]["edit_client_id"] = client_id
-        bot.edit_message_text("📞 Введите новый телефон:", chat_id, call.message.message_id)
-        bot.answer_callback_query(call.id)
-    
-    elif data == "back_to_clients":
-        show_all_clients(chat_id)
+        bot.edit_message_text(
+            "📞 Введите новый телефон:", chat_id, call.message.message_id,
+            reply_markup=back_to_client_keyboard(client_id)
+        )
         bot.answer_callback_query(call.id)
 
 # ==================== ЗАПУСК ====================
